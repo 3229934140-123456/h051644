@@ -2,7 +2,7 @@ const path = require('path');
 const fs = require('fs');
 const fse = require('fs-extra');
 const acorn = require('acorn');
-const { SourceMapGenerator } = require('./source-map');
+const { SourceMapGenerator, SourceMapConsumer } = require('./source-map');
 
 const GLOBAL_NS = '__mini_pack';
 
@@ -702,93 +702,248 @@ class Bundler {
     const manifest = results.find((r) => r.isManifest)?.manifest || this.manifest || null;
     const manifestJson = manifest ? JSON.stringify(manifest, null, 2) : 'null';
 
-    const chunkList = results
-      .filter((r) => !r.isManifest)
+    const chunkInfos = results
+      .filter((r) => !r.isManifest && !r.isHtml)
       .map((r) => {
         const m = (manifest && manifest.chunks && manifest.chunks[r.name]) || {};
+        const sizeBytes = Buffer.byteLength(r.code, 'utf-8');
         return {
           name: r.name,
-          sizeKB: (Buffer.byteLength(r.code, 'utf-8') / 1024).toFixed(2),
+          sizeBytes,
+          sizeKB: (sizeBytes / 1024).toFixed(2),
           isEntry: !!r.isEntry,
           isShared: !!r.isShared,
           moduleCount: (m.modules || []).length,
           modules: m.modules || [],
           dependencies: m.dependencies || [],
+          entryModule: m.entryModule || null,
+          entryModuleId: m.entryModuleId != null ? m.entryModuleId : null,
         };
       });
 
-    const chunkListHtml = chunkList
+    const smLookup = {};
+    const smData = {};
+    for (const r of results) {
+      if (r.isManifest || r.isHtml) continue;
+      if (!r.sourcemap) continue;
+      try {
+        const consumer = new SourceMapConsumer(r.sourcemap);
+        const table = {};
+        const lines = r.code.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+          const gl = i + 1;
+          const pos = consumer.originalPositionFor({ line: gl, column: 0 });
+          if (pos.source != null) {
+            table[gl] = {
+              source: pos.source,
+              line: pos.line,
+              column: pos.column,
+              name: pos.name || null,
+            };
+          }
+        }
+        smLookup[r.name] = table;
+        smData[r.name] = {
+          sources: r.sourcemap.sources || [],
+          sourcesContent: r.sourcemap.sourcesContent || [],
+        };
+      } catch (e) {}
+    }
+
+    const smLookupJson = JSON.stringify(smLookup);
+    const smDataJson = JSON.stringify(smData);
+
+    const chunkListHtml = chunkInfos
       .map((c) => {
-        const badge = c.isEntry ? '📦 Entry' : c.isShared ? '🔗 Shared' : '🧩 Chunk';
-        const depsStr = c.dependencies.length > 0 ? `<br><small>Deps: ${c.dependencies.join(', ')}</small>` : '';
-        const modsStr = c.modules.length > 0 ? `<br><small>Modules: ${c.modules.join(', ')}</small>` : '';
-        return `<li><strong>${c.name}.js</strong> <em>(${c.sizeKB} KB)</em> <span style="color:#888">${badge}</span>${depsStr}${modsStr}</li>`;
+        const typeBadge = c.isEntry ? '📦 Entry' : c.isShared ? '🔗 Shared' : '🧩 Async';
+        const typeClass = c.isEntry ? 'chunk-type-entry' : c.isShared ? 'chunk-type-shared' : 'chunk-type-async';
+        const depsStr = c.dependencies.length > 0
+          ? `<div class="chunk-sub">Dependencies: <strong>${c.dependencies.join(', ')}</strong></div>`
+          : '';
+        const entryStr = c.entryModule
+          ? `<div class="chunk-sub">Entry: <code>${c.entryModule}</code> (id ${c.entryModuleId})</div>`
+          : '';
+        const modsStr = c.modules.length > 0
+          ? `<div class="chunk-sub">Modules (${c.moduleCount}): ${c.modules.map((m) => `<span class="tag">${m}</span>`).join(' ')}</div>`
+          : '';
+        return `
+<li class="chunk-card ${typeClass}" id="chunk-card-${c.name}" data-chunk="${c.name}">
+  <div class="chunk-header">
+    <span class="chunk-name">${c.name}.js</span>
+    <span class="chunk-size">${c.sizeKB} KB</span>
+  </div>
+  <div class="chunk-badge">${typeBadge}</div>
+  ${depsStr}
+  ${entryStr}
+  ${modsStr}
+  <div class="chunk-status" id="chunk-status-${c.name}">
+    <span class="status-dot status-pending"></span>
+    <span class="status-text">Pending</span>
+  </div>
+</li>`;
       })
       .join('\n');
+
+    const chunkNames = chunkInfos.map((c) => c.name);
+    const chunkNamesJson = JSON.stringify(chunkNames);
 
     const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>mini-pack Demo</title>
+<title>mini-pack Browser Demo</title>
 <style>
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
-  .container { max-width: 900px; margin: 0 auto; background: #fff; border-radius: 8px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-  h1 { margin-top: 0; color: #333; }
-  h2 { color: #555; border-bottom: 1px solid #eee; padding-bottom: 8px; }
-  .controls { margin: 16px 0; display: flex; gap: 10px; flex-wrap: wrap; }
-  button { padding: 10px 18px; font-size: 14px; border: none; border-radius: 4px; cursor: pointer; background: #4a90d9; color: white; transition: background 0.2s; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 16px; background: #f0f2f5; color: #333; }
+  .layout { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: 340px 1fr; gap: 16px; }
+  h1 { margin: 0 0 4px 0; font-size: 20px; color: #1a1a2e; }
+  h2 { margin: 0 0 12px 0; font-size: 14px; color: #555; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #e0e0e0; padding-bottom: 6px; }
+  .panel { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .header-panel { grid-column: 1 / -1; }
+  .sub { color: #888; font-size: 13px; margin-bottom: 8px; }
+
+  /* Chunk graph */
+  .chunk-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px; }
+  .chunk-card { position: relative; border: 1px solid #e0e0e0; border-radius: 6px; padding: 10px 12px; background: #fafafa; transition: all 0.2s; }
+  .chunk-card.chunk-type-entry { border-left: 4px solid #4a90d9; }
+  .chunk-card.chunk-type-shared { border-left: 4px solid #f5a623; }
+  .chunk-card.chunk-type-async { border-left: 4px solid #7ed321; }
+  .chunk-card.loaded { background: #e8f5e9; border-color: #81c784; }
+  .chunk-card.loading { background: #fff3e0; border-color: #ffb74d; }
+  .chunk-header { display: flex; justify-content: space-between; align-items: center; }
+  .chunk-name { font-weight: 600; font-size: 14px; }
+  .chunk-size { color: #888; font-size: 12px; font-family: monospace; }
+  .chunk-badge { position: absolute; top: 10px; right: 12px; font-size: 10px; padding: 2px 6px; border-radius: 10px; background: #e0e0e0; color: #555; text-transform: uppercase; }
+  .chunk-card.chunk-type-entry .chunk-badge { background: #bbdefb; color: #1565c0; }
+  .chunk-card.chunk-type-shared .chunk-badge { background: #ffe0b2; color: #e65100; }
+  .chunk-card.chunk-type-async .chunk-badge { background: #dcedc8; color: #33691e; }
+  .chunk-sub { font-size: 11px; color: #666; margin-top: 4px; }
+  .chunk-sub code { background: #eee; padding: 1px 4px; border-radius: 3px; font-size: 10px; }
+  .chunk-sub .tag { display: inline-block; background: #e8e8e8; padding: 1px 6px; border-radius: 10px; margin: 1px 2px; font-size: 10px; }
+  .chunk-status { margin-top: 8px; display: flex; align-items: center; gap: 6px; font-size: 12px; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .status-dot.status-pending { background: #bdbdbd; }
+  .status-dot.status-loading { background: #ff9800; animation: pulse 1s infinite; }
+  .status-dot.status-loaded { background: #4caf50; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .status-text { color: #666; }
+
+  /* Controls */
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  button { padding: 8px 14px; font-size: 13px; border: none; border-radius: 4px; cursor: pointer; background: #4a90d9; color: white; transition: background 0.2s; font-weight: 500; }
   button:hover { background: #357abd; }
-  button.secondary { background: #6c757d; }
-  button.secondary:hover { background: #5a6268; }
-  .log-panel { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 4px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; max-height: 360px; overflow-y: auto; line-height: 1.5; }
-  .log-entry { margin: 4px 0; padding: 2px 0; border-bottom: 1px solid #2a2a2a; }
+  button.secondary { background: #78909c; }
+  button.secondary:hover { background: #546e7a; }
+  button.success { background: #4caf50; }
+  button.success:hover { background: #388e3c; }
+  button:disabled { background: #bdbdbd; cursor: not-allowed; }
+  .status-bar { padding: 6px 12px; border-radius: 4px; background: #e8f5e9; color: #2e7d32; display: inline-block; font-size: 12px; margin-bottom: 8px; }
+  .status-bar.error { background: #ffebee; color: #c62828; }
+
+  /* Log panel */
+  .log-panel { background: #1e1e1e; color: #d4d4d4; padding: 12px; border-radius: 6px; font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; max-height: 380px; overflow-y: auto; line-height: 1.5; }
+  .log-entry { padding: 2px 0; border-bottom: 1px solid #2a2a2a; white-space: pre-wrap; word-break: break-all; }
   .log-entry:last-child { border-bottom: none; }
-  .log-log { color: #d4d4d4; }
-  .log-info { color: #4ec9b0; }
-  .log-warn { color: #dcdcaa; }
-  .log-error { color: #f48771; }
-  .log-ts { color: #808080; margin-right: 8px; }
-  .chunk-list { list-style: none; padding: 0; }
-  .chunk-list li { padding: 8px 12px; border-left: 3px solid #4a90d9; background: #f8f9fa; margin-bottom: 6px; border-radius: 0 4px 4px 0; }
-  .note { background: #fff3cd; color: #856404; padding: 12px 16px; border-radius: 4px; margin: 12px 0; }
-  .status { padding: 6px 12px; border-radius: 4px; background: #e8f5e9; color: #2e7d32; display: inline-block; font-size: 13px; }
-  .status.error { background: #ffebee; color: #c62828; }
+  .log-event { padding-left: 24px; position: relative; }
+  .log-event::before {
+    content: attr(data-icon);
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 20px;
+    text-align: center;
+  }
+  .log-cat-boot { color: #ce93d8; }
+  .log-cat-shared { color: #ffb74d; }
+  .log-cat-dynamic { color: #81d4fa; }
+  .log-cat-cache { color: #a5d6a7; }
+  .log-cat-log { color: #d4d4d4; }
+  .log-cat-error { color: #ef9a9a; }
+  .log-ts { color: #666; margin-right: 8px; font-size: 11px; }
+  .log-detail { color: #888; font-size: 11px; margin-left: 28px; margin-top: 2px; }
+
+  /* Source map panel */
+  .sm-panel { margin-top: 16px; }
+  .sm-controls { display: flex; gap: 6px; margin-bottom: 10px; align-items: center; flex-wrap: wrap; }
+  .sm-controls select, .sm-controls input {
+    padding: 6px 8px; font-size: 12px; border: 1px solid #ccc; border-radius: 4px; background: #fff;
+  }
+  .sm-controls select { min-width: 120px; }
+  .sm-controls input[type=number] { width: 80px; }
+  .sm-result { background: #fafafa; border: 1px solid #e0e0e0; border-radius: 4px; padding: 10px; font-family: monospace; font-size: 12px; }
+  .sm-result .sm-hit { color: #2e7d32; font-weight: bold; }
+  .sm-result .sm-miss { color: #c62828; }
+  .sm-result .sm-source { color: #1565c0; }
+  .sm-result .sm-line { color: #6a1b9a; }
+  .sm-context { background: #2d2d2d; color: #d4d4d4; padding: 8px; border-radius: 4px; margin-top: 8px; max-height: 200px; overflow-y: auto; font-size: 11px; }
+  .sm-context .sm-ctx-line { padding: 1px 4px; }
+  .sm-context .sm-ctx-target { background: #ffeb3b; color: #000; font-weight: bold; }
+
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
-<div class="container">
-  <h1>🗜️ mini-pack Browser Demo</h1>
-  <p>Test side-effect modules, dynamic chunk loading, shared dependencies, and source maps.</p>
-
-  <div class="note">
-    <strong>Tip:</strong> Open the DevTools console (F12) to see the same logs. Click buttons below to trigger dynamic loading and observe that shared dependencies only execute once.
+<div class="layout">
+  <div class="panel header-panel">
+    <h1>🗜️ mini-pack Browser Demo</h1>
+    <div class="sub">Side-effect modules · Dynamic chunk loading · Shared dependencies · Source maps</div>
   </div>
 
-  <h2>🛠️ Build Artifacts</h2>
-  <ul class="chunk-list">
-    ${chunkListHtml}
-  </ul>
-
-  <h2>▶️ Runtime Controls</h2>
-  <div class="controls">
-    <button id="btn-dashboard">Load Dashboard (Dynamic)</button>
-    <button id="btn-dashboard-again" class="secondary">Load Dashboard Again (Cached)</button>
-    <button id="btn-check-cache" class="secondary">Check Module Cache</button>
-    <button id="btn-clear-log" class="secondary">Clear Log Panel</button>
-  </div>
-  <div style="margin: 8px 0;">
-    <span id="status-label" class="status">Page loaded — main.js has executed automatically</span>
+  <div class="panel">
+    <h2>📦 Chunk Dependency Graph</h2>
+    <ul class="chunk-list" id="chunk-list">
+      ${chunkListHtml}
+    </ul>
+    <div class="sub" style="margin-top: 12px;">
+      <strong>Legend:</strong>
+      <span style="color:#1565c0">■ Entry</span> ·
+      <span style="color:#e65100">■ Shared</span> ·
+      <span style="color:#33691e">■ Async</span>
+    </div>
   </div>
 
-  <h2>📋 Console Output</h2>
-  <div class="log-panel" id="log-panel"></div>
+  <div>
+    <div class="panel">
+      <h2>▶️ Runtime Controls</h2>
+      <div class="controls">
+        <button id="btn-dashboard" class="success">Load Dashboard</button>
+        <button id="btn-dashboard-again" class="secondary">Load Again (Cache)</button>
+        <button id="btn-check-cache" class="secondary">Inspect Cache</button>
+        <button id="btn-clear-log" class="secondary">Clear Log</button>
+      </div>
+      <div id="status-bar" class="status-bar">Initializing...</div>
+    </div>
+
+    <div class="panel" style="margin-top: 16px;">
+      <h2>📋 Event Log</h2>
+      <div class="log-panel" id="log-panel"></div>
+    </div>
+
+    <div class="panel sm-panel">
+      <h2>🔍 Source Map Inspector</h2>
+      <div class="sm-controls">
+        <select id="sm-chunk">
+          ${chunkInfos.map((c) => `<option value="${c.name}">${c.name}.js</option>`).join('\n')}
+        </select>
+        <span>Line:</span>
+        <input type="number" id="sm-line" min="1" value="1" />
+        <button id="sm-query">Query</button>
+      </div>
+      <div class="sm-result" id="sm-result">Select a chunk and line, then click Query.</div>
+      <div class="sm-context" id="sm-context" style="display:none;"></div>
+    </div>
+  </div>
 </div>
 
 <script>
 (function() {
   var __MANIFEST__ = ${manifestJson};
+  var __SM_LOOKUP__ = ${smLookupJson};
+  var __SM_DATA__ = ${smDataJson};
+  var __CHUNK_NAMES__ = ${chunkNamesJson};
+
   if (typeof window !== 'undefined') {
     window.__mini_pack = window.__mini_pack || {};
     window.__mini_pack.manifest = __MANIFEST__;
@@ -798,7 +953,7 @@ class Bundler {
 <script>
 (function() {
   var panel = document.getElementById('log-panel');
-  var statusLabel = document.getElementById('status-label');
+  var statusBar = document.getElementById('status-bar');
 
   var originalLog = console.log;
   var originalWarn = console.warn;
@@ -810,18 +965,29 @@ class Bundler {
     return d.toTimeString().split(' ')[0] + '.' + String(d.getMilliseconds()).padStart(3, '0');
   }
 
-  function addLog(level, args) {
+  function addEvent(category, icon, message, detail) {
     var entry = document.createElement('div');
-    entry.className = 'log-entry log-' + level;
+    entry.className = 'log-entry log-event log-cat-' + category;
+    entry.setAttribute('data-icon', icon);
+    var html = '<span class="log-ts">[' + ts() + ']</span>' + String(message);
+    if (detail) html += '<div class="log-detail">' + detail + '</div>';
+    entry.innerHTML = html;
+    panel.appendChild(entry);
+    panel.scrollTop = panel.scrollHeight;
+  }
+
+  function addLog(level, args) {
     var parts = Array.prototype.slice.call(args).map(function(a) {
       if (typeof a === 'object') {
         try { return JSON.stringify(a); } catch (e) { return String(a); }
       }
       return String(a);
     });
-    entry.innerHTML = '<span class="log-ts">[' + ts() + ']</span>' + parts.join(' ');
-    panel.appendChild(entry);
-    panel.scrollTop = panel.scrollHeight;
+    var cat = 'log';
+    if (level === 'error') cat = 'error';
+    else if (level === 'warn') cat = 'log';
+    else if (level === 'info') cat = 'log';
+    addEvent(cat, '📝', parts.join(' '));
   }
 
   console.log = function() { originalLog.apply(console, arguments); addLog('log', arguments); };
@@ -830,20 +996,28 @@ class Bundler {
   console.error = function() { originalError.apply(console, arguments); addLog('error', arguments); };
 
   window.addEventListener('error', function(e) {
-    addLog('error', ['[Window Error]', e.message, '(' + e.filename + ':' + e.lineno + ')']);
-    if (statusLabel) {
-      statusLabel.textContent = 'Error: ' + e.message;
-      statusLabel.className = 'status error';
-    }
+    addEvent('error', '❌', 'Window error: ' + e.message, e.filename + ':' + e.lineno);
+    if (statusBar) { statusBar.textContent = 'Error: ' + e.message; statusBar.className = 'status-bar error'; }
   });
 
   window.addEventListener('unhandledrejection', function(e) {
-    addLog('error', ['[Unhandled Promise]', String(e.reason)]);
-    if (statusLabel) {
-      statusLabel.textContent = 'Promise rejection: ' + String(e.reason);
-      statusLabel.className = 'status error';
-    }
+    addEvent('error', '❌', 'Unhandled promise: ' + String(e.reason));
+    if (statusBar) { statusBar.textContent = 'Promise error: ' + String(e.reason); statusBar.className = 'status-bar error'; }
   });
+
+  function setChunkStatus(name, status, text) {
+    var card = document.getElementById('chunk-card-' + name);
+    if (!card) return;
+    card.classList.remove('loaded', 'loading');
+    if (status === 'loaded') card.classList.add('loaded');
+    else if (status === 'loading') card.classList.add('loading');
+    var statusEl = document.getElementById('chunk-status-' + name);
+    if (!statusEl) return;
+    var dot = statusEl.querySelector('.status-dot');
+    var txt = statusEl.querySelector('.status-text');
+    if (dot) { dot.className = 'status-dot status-' + status; }
+    if (txt) { txt.textContent = text || (status.charAt(0).toUpperCase() + status.slice(1)); }
+  }
 
   function topoSortChunks(manifest) {
     if (!manifest || !manifest.chunks) return [];
@@ -868,7 +1042,7 @@ class Bundler {
       });
     }
     if (result.length !== names.length) {
-      addLog('warn', ['Chunk dependency cycle detected! Falling back to natural order.']);
+      addEvent('error', '⚠️', 'Chunk dependency cycle detected', 'Falling back to natural order');
       return names;
     }
     return result;
@@ -879,6 +1053,8 @@ class Bundler {
       var ns = window.__mini_pack || {};
       if (ns.chunks && ns.chunks[name]) { resolve(); return; }
       if (ns.chunkPromises && ns.chunkPromises[name]) { ns.chunkPromises[name].then(resolve, reject); return; }
+      setChunkStatus(name, 'loading', 'Loading...');
+      addEvent('dynamic', '⬇️', 'Loading chunk: ' + name + '.js');
       var script = document.createElement('script');
       script.src = name + '.js';
       script.onload = function() {
@@ -886,22 +1062,32 @@ class Bundler {
           window.__mini_pack.chunks = window.__mini_pack.chunks || {};
           window.__mini_pack.chunks[name] = true;
         }
+        setChunkStatus(name, 'loaded', 'Loaded');
+        addEvent('dynamic', '✅', 'Chunk loaded: ' + name + '.js');
         resolve();
       };
-      script.onerror = function() { reject(new Error('Failed to load ' + name + '.js')); };
+      script.onerror = function() {
+        setChunkStatus(name, 'error', 'Failed');
+        addEvent('error', '❌', 'Failed to load ' + name + '.js');
+        reject(new Error('Failed to load ' + name + '.js'));
+      };
       document.head.appendChild(script);
     });
   }
 
-  function loadChunksInOrder(orderedNames) {
-    var p = Promise.resolve();
-    orderedNames.forEach(function(n) {
-      p = p.then(function() {
-        addLog('info', ['Loading chunk: ' + n + '.js ...']);
-        return loadScript(n);
+  function loadChunkWithDeps(name) {
+    var ns = window.__mini_pack;
+    if (ns && ns.loadChunk) {
+      setChunkStatus(name, 'loading', 'Loading...');
+      var info = (ns.manifest && ns.manifest.chunks) ? ns.manifest.chunks[name] : null;
+      var deps = info ? (info.dependencies || []) : [];
+      if (deps.length > 0) addEvent('shared', '🔗', 'Resolving dependencies for ' + name + ': [' + deps.join(', ') + ']');
+      return ns.loadChunk(name).then(function() {
+        setChunkStatus(name, 'loaded', 'Loaded');
+        return null;
       });
-    });
-    return p;
+    }
+    return loadScript(name);
   }
 
   function bootstrapEntry() {
@@ -916,7 +1102,7 @@ class Bundler {
       }
     }
     if (entryId == null) return null;
-    addLog('info', ['Bootstrapping entry chunk ' + entryName + ' (module ' + entryId + ')...']);
+    addEvent('boot', '📦', 'Bootstrapping entry module: ' + entryName + ' (id ' + entryId + ')');
     try {
       var exp = ns.require(entryId);
       if (typeof exp === 'object' && exp) {
@@ -926,51 +1112,50 @@ class Bundler {
           }
         }
       }
+      addEvent('boot', '✅', 'Entry bootstrap complete');
       return exp;
     } catch (e) {
-      addLog('error', ['Entry bootstrap failed:', e.message || e]);
+      addEvent('error', '❌', 'Entry bootstrap failed', e.message || e);
       throw e;
     }
   }
 
-  function loadDashboard(attemptLabel) {
+  function loadDashboard(label) {
     var ns = window.__mini_pack;
-    if (!ns) { addLog('error', ['__mini_pack runtime not initialized']); return Promise.reject(); }
-    addLog('info', ['— Triggering dashboard load (' + attemptLabel + ')... —']);
+    if (!ns) { addEvent('error', '❌', '__mini_pack runtime not initialized'); return Promise.reject(); }
     var chunkName = 'dashboard';
-    if (!ns.manifest || !ns.manifest.chunks || !ns.manifest.chunks[chunkName]) {
-      addLog('error', ['Manifest has no info for chunk: ' + chunkName]);
+    var info = ns.manifest && ns.manifest.chunks ? ns.manifest.chunks[chunkName] : null;
+    if (!info) {
+      addEvent('error', '❌', 'Manifest has no info for chunk: ' + chunkName);
       return Promise.reject();
     }
-    var dashInfo = ns.manifest.chunks[chunkName];
-    var entryId = dashInfo.entryModuleId;
-    var loadPromise;
-    if (ns.loadChunk) {
-      loadPromise = ns.loadChunk(chunkName);
+    var entryId = info.entryModuleId;
+
+    var isCached = ns.chunks && ns.chunks[chunkName];
+    if (isCached) {
+      addEvent('cache', '💾', 'Chunk cache hit: ' + chunkName + ' (already loaded)');
     } else {
-      var deps = dashInfo.dependencies || [];
-      loadPromise = Promise.all(deps.map(function(d) { return loadScript(d); })).then(function() { return loadScript(chunkName); });
+      addEvent('dynamic', '⚡', 'Dynamic load: ' + chunkName + ' (' + label + ')');
     }
-    return loadPromise.then(function() {
-      addLog('info', ['Dashboard chunk ready. Requiring entry module ' + entryId + ' and calling init()...']);
-      if (!ns.require) { addLog('error', ['__mini_pack.require missing']); return; }
+
+    return loadChunkWithDeps(chunkName).then(function() {
+      addEvent('dynamic', '✅', chunkName + ' chunk ready, requiring entry module ' + entryId);
+      if (!ns.require) { addEvent('error', '❌', '__mini_pack.require missing'); return; }
       var dashExports = ns.require(entryId);
       if (dashExports && typeof dashExports.init === 'function') {
+        addEvent('dynamic', '▶️', 'Calling dashboard.init()...');
         dashExports.init();
       }
-      return dashExports;
-    }).then(function(exports) {
-      if (statusLabel) {
-        statusLabel.textContent = 'Dashboard loaded successfully (' + attemptLabel + ')';
-        statusLabel.className = 'status';
+      if (statusBar) {
+        statusBar.textContent = 'Dashboard loaded (' + label + ')';
+        statusBar.className = 'status-bar';
       }
-      addLog('info', ['— Dashboard promise resolved —']);
-      return exports;
+      return dashExports;
     }).catch(function(err) {
-      addLog('error', ['Dashboard load failed:', err.message || err]);
-      if (statusLabel) {
-        statusLabel.textContent = 'Failed: ' + (err.message || err);
-        statusLabel.className = 'status error';
+      addEvent('error', '❌', 'Dashboard load failed', err.message || err);
+      if (statusBar) {
+        statusBar.textContent = 'Failed: ' + (err.message || err);
+        statusBar.className = 'status-bar error';
       }
       throw err;
     });
@@ -985,50 +1170,154 @@ class Bundler {
   if (btn2) btn2.addEventListener('click', function() { loadDashboard('cached'); });
   if (btn3) btn3.addEventListener('click', function() {
     var ns = window.__mini_pack || {};
-    addLog('info', ['=== Module Cache State ===']);
-    addLog('log', ['Chunks loaded:', Object.keys(ns.chunks || {}).join(', ') || '(none)']);
+    addEvent('cache', '💾', 'Module cache inspection');
+    addEvent('cache', '  ', 'Chunks loaded: ' + (Object.keys(ns.chunks || {}).join(', ') || '(none)'));
     var cacheKeys = Object.keys(ns.cache || {});
-    addLog('log', ['Module cache size:', cacheKeys.length, '(ids: ' + cacheKeys.join(', ') + ')']);
+    addEvent('cache', '  ', 'Module cache size: ' + cacheKeys.length + ' (ids: ' + cacheKeys.join(', ') + ')');
     if (ns.cache) {
       for (var id in ns.cache) {
         if (ns.cache.hasOwnProperty(id)) {
           var exp = ns.cache[id];
-          var keys = Object.keys(exp).filter(function(k) { return k !== 'default' || Object.keys(exp).length > 1; });
-          addLog('log', ['  id=' + id + ' exports:', keys.length > 0 ? '{' + Object.keys(exp).join(', ') + '}' : '{}']);
+          var keys = Object.keys(exp);
+          addEvent('cache', '  ', '  id=' + id + ' → {' + keys.join(', ') + '}');
         }
       }
     }
-    if (ns.manifest) {
-      addLog('info', ['=== Manifest: Chunk Dependencies ===']);
-      for (var cname in ns.manifest.chunks) {
-        if (ns.manifest.chunks.hasOwnProperty(cname)) {
-          var c = ns.manifest.chunks[cname];
-          addLog('log', ['  ' + cname + ' → deps: [' + (c.dependencies || []).join(', ') + '], modules: ' + (c.modules || []).length + ', entryId: ' + (c.entryModuleId != null ? c.entryModuleId : '(none)')]);
-        }
-      }
-    }
-    if (statusLabel) {
-      statusLabel.textContent = 'Cache inspected — check console above';
-      statusLabel.className = 'status';
+    if (statusBar) {
+      statusBar.textContent = 'Cache inspected — see event log';
+      statusBar.className = 'status-bar';
     }
   });
   if (btn4) btn4.addEventListener('click', function() { panel.innerHTML = ''; });
 
-  addLog('info', ['=== Demo page bootstrap starting... ===']);
+  // Source map inspector
+  var smChunk = document.getElementById('sm-chunk');
+  var smLine = document.getElementById('sm-line');
+  var smQuery = document.getElementById('sm-query');
+  var smResult = document.getElementById('sm-result');
+  var smContext = document.getElementById('sm-context');
 
-  var ordered = topoSortChunks(window.__mini_pack && window.__mini_pack.manifest);
-  addLog('log', ['Chunk load order (from manifest):', ordered.join(' → ')]);
-
-  loadChunksInOrder(ordered).then(function() {
-    addLog('info', ['All entry chunks loaded. Bootstrapping entry module...']);
-    bootstrapEntry();
-    if (statusLabel) {
-      statusLabel.textContent = 'Ready — main has executed, you can load dashboard now';
-      statusLabel.className = 'status';
+  function querySourceMap(chunkName, lineNum) {
+    var lookup = __SM_LOOKUP__[chunkName];
+    var data = __SM_DATA__[chunkName];
+    if (!lookup || !data) {
+      smResult.innerHTML = '<span class="sm-miss">No source map for ' + chunkName + '</span>';
+      smContext.style.display = 'none';
+      return;
     }
-    addLog('info', ['=== Bootstrap complete ===']);
+    var hit = lookup[lineNum];
+    if (!hit) {
+      var prev = null;
+      var sortedKeys = Object.keys(lookup).map(Number).sort(function(a,b){return a-b;});
+      for (var i = 0; i < sortedKeys.length; i++) {
+        if (sortedKeys[i] < lineNum) prev = sortedKeys[i];
+        else break;
+      }
+      if (prev != null) {
+        var prevHit = lookup[prev];
+        smResult.innerHTML = '<span class="sm-miss">No exact mapping at line ' + lineNum + '</span><br>' +
+          '<span style="color:#888">Nearest mapped line: ' + prev + ' → </span>' +
+          '<span class="sm-source">' + prevHit.source + '</span>:' +
+          '<span class="sm-line">' + prevHit.line + '</span>';
+        hit = prevHit;
+        lineNum = prev;
+      } else {
+        smResult.innerHTML = '<span class="sm-miss">No mapping found for line ' + lineNum + '</span> (runtime / wrapper code)';
+        smContext.style.display = 'none';
+        return;
+      }
+    } else {
+      smResult.innerHTML = '<span class="sm-hit">✓ Mapped</span> — ' +
+        '<span class="sm-source">' + hit.source + '</span> line <span class="sm-line">' + hit.line + '</span>' +
+        (hit.column != null ? ', col ' + hit.column : '') +
+        (hit.name ? ' <span style="color:#888">(symbol: ' + hit.name + ')</span>' : '');
+    }
+
+    var sources = data.sources || [];
+    var sourcesContent = data.sourcesContent || [];
+    var srcIdx = sources.indexOf(hit.source);
+
+    if (srcIdx >= 0 && srcIdx < sourcesContent.length && sourcesContent[srcIdx]) {
+      var lines = sourcesContent[srcIdx].split('\n');
+      var target = hit.line;
+      var html = '';
+      var start = Math.max(0, target - 4);
+      var end = Math.min(lines.length, target + 3);
+      for (var l = start; l < end; l++) {
+        var ln = l + 1;
+        var cls = 'sm-ctx-line' + (ln === target ? ' sm-ctx-target' : '');
+        var lineStr = String(ln).padStart(3, ' ');
+        var content = lines[l] || '';
+        content = content.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        html += '<div class="' + cls + '">  ' + lineStr + ' | ' + content + '</div>';
+      }
+      smContext.innerHTML = '<div style="color:#888;margin-bottom:4px;">Source context from ' + hit.source + '</div>' + html;
+      smContext.style.display = 'block';
+    } else {
+      smContext.style.display = 'none';
+    }
+  }
+
+  if (smQuery) smQuery.addEventListener('click', function() {
+    querySourceMap(smChunk.value, parseInt(smLine.value, 10));
+  });
+  if (smLine) smLine.addEventListener('keypress', function(e) {
+    if (e.key === 'Enter') querySourceMap(smChunk.value, parseInt(smLine.value, 10));
+  });
+
+  // === Bootstrap ===
+  addEvent('boot', '🚀', 'Mini-pack demo starting...');
+
+  var manifest = window.__mini_pack.manifest;
+  var allChunks = Object.keys(manifest.chunks);
+  allChunks.forEach(function(n) { setChunkStatus(n, 'pending', 'Pending'); });
+
+  // Collect entry chunks and their transitive deps — these load upfront
+  var entryChunks = [];
+  var upfrontSet = {};
+  for (var n in manifest.chunks) {
+    if (manifest.chunks.hasOwnProperty(n) && manifest.chunks[n].isEntry) {
+      entryChunks.push(n);
+    }
+  }
+  function collectDeps(name, set) {
+    if (set[name]) return;
+    set[name] = true;
+    var deps = (manifest.chunks[name] && manifest.chunks[name].dependencies) || [];
+    deps.forEach(function(d) { collectDeps(d, set); });
+  }
+  entryChunks.forEach(function(n) { collectDeps(n, upfrontSet); });
+
+  var upfrontNames = Object.keys(upfrontSet);
+  var ordered = topoSortChunks(manifest).filter(function(n) { return upfrontSet[n]; });
+
+  addEvent('boot', '📋', 'Upfront chunks (entry + deps): ' + ordered.join(', '));
+  addEvent('boot', '⏳', 'Async chunks will load on demand: ' +
+    allChunks.filter(function(n) { return !upfrontSet[n]; }).join(', '));
+
+  // Load upfront chunks sequentially
+  var loadChain = Promise.resolve();
+  ordered.forEach(function(n) {
+    loadChain = loadChain.then(function() {
+      if (n && manifest.chunks[n] && manifest.chunks[n].isShared) {
+        addEvent('shared', '🔗', 'Loading shared dependency: ' + n + '.js');
+      }
+      return loadScript(n);
+    });
+  });
+
+  loadChain.then(function() {
+    addEvent('shared', '✅', 'All shared dependencies ready');
+    addEvent('boot', '⚙️', 'Running entry bootstrap...');
+    return bootstrapEntry();
+  }).then(function() {
+    addEvent('boot', '🎉', 'Page ready! Click "Load Dashboard" to test dynamic loading.');
+    if (statusBar) {
+      statusBar.textContent = 'Ready — main has executed, click Load Dashboard';
+      statusBar.className = 'status-bar';
+    }
   }).catch(function(err) {
-    addLog('error', ['Bootstrap failed:', err.message || err]);
+    addEvent('error', '❌', 'Bootstrap failed', err.message || err);
   });
 })();
 </script>
