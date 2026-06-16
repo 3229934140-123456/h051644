@@ -1,0 +1,21 @@
+{
+  "name": "mini-pack",
+  "version": "1.0.0",
+  "description": "A minimal static asset bundler similar to a simplified webpack",
+  "main": "src/cli.js",
+  "bin": {
+    "mini-pack": "src/cli.js"
+  },
+  "scripts": {
+    "build": "node src/cli.js --entry example/src/index.js --output example/dist",
+    "build:watch": "node src/cli.js --entry example/src/index.js --output example/dist --watch"
+  },
+  "dependencies": {
+    "acorn": "^8.11.3",
+    "acorn-walk": "^8.3.1",
+    "commander": "^12.0.0",
+    "fs-extra": "^11.2.0",
+    "chokidar": "^3.6.0",
+    "glob": "^10.3.10"
+  }
+}
