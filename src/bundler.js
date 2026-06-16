@@ -126,11 +126,12 @@ class Bundler {
       }
 
       for (const [chunkName, chunk] of this.chunks) {
-        if (chunk.isEntry || chunk.isShared) continue;
-        const dynEntry = chunk.entryModule;
-        const mod = this.graph.getModule(dynEntry);
-        if (!mod) continue;
-        const needsShared = [...mod.dependencies].some((dep) => sharedModules.has(dep));
+        if (chunk.isShared) continue;
+        const needsShared = [...chunk.modules].some((modPath) => {
+          const mod = this.graph.getModule(modPath);
+          if (!mod) return false;
+          return [...mod.dependencies].some((dep) => sharedModules.has(dep));
+        });
         if (needsShared && !chunk.dependencies.includes('shared')) {
           chunk.dependencies.push('shared');
         }
@@ -143,13 +144,28 @@ class Bundler {
     };
 
     for (const [chunkName, chunk] of this.chunks) {
-      manifest.chunks[chunkName] = {
+      const chunkInfo = {
         name: chunkName,
         isEntry: !!chunk.isEntry,
         isShared: !!chunk.isShared,
         dependencies: chunk.dependencies || [],
         modules: [...chunk.modules].map((p) => path.relative(process.cwd(), p).replace(/\\/g, '/')),
       };
+      if (chunk.entryModule) {
+        const rel = path.relative(process.cwd(), chunk.entryModule).replace(/\\/g, '/');
+        chunkInfo.entryModule = rel;
+        chunkInfo.entryModuleId = this.moduleIdMap.get(chunk.entryModule);
+      } else if (chunk.isEntry) {
+        for (const entry of this.graph.entries) {
+          if (this.graph.getModule(entry) && chunk.modules.has(entry)) {
+            const rel = path.relative(process.cwd(), entry).replace(/\\/g, '/');
+            chunkInfo.entryModule = rel;
+            chunkInfo.entryModuleId = this.moduleIdMap.get(entry);
+            break;
+          }
+        }
+      }
+      manifest.chunks[chunkName] = chunkInfo;
     }
 
     for (const [filePath, id] of this.moduleIdMap) {
@@ -276,27 +292,22 @@ class Bundler {
       header += `${GLOBAL_NS}.loadChunk = ${GLOBAL_NS}.loadChunk || function(name) {\n`;
       header += `  if (${GLOBAL_NS}.chunks[name]) return Promise.resolve();\n`;
       header += `  if (${GLOBAL_NS}.chunkPromises[name]) return ${GLOBAL_NS}.chunkPromises[name];\n`;
-      header += `  var loadOne = function(n) {\n`;
-      header += `    if (${GLOBAL_NS}.chunks[n]) return Promise.resolve();\n`;
-      header += `    if (${GLOBAL_NS}.chunkPromises[n]) return ${GLOBAL_NS}.chunkPromises[n];\n`;
-      header += `    ${GLOBAL_NS}.chunkPromises[n] = new Promise(function(resolve, reject) {\n`;
+      header += `  var chunkInfo = (${GLOBAL_NS}.manifest && ${GLOBAL_NS}.manifest.chunks) ? ${GLOBAL_NS}.manifest.chunks[name] : null;\n`;
+      header += `  var deps = chunkInfo ? (chunkInfo.dependencies || []) : [];\n`;
+      header += `  var loadSelf = function() {\n`;
+      header += `    return new Promise(function(resolve, reject) {\n`;
       header += `      var script = document.createElement("script");\n`;
-      header += `      script.src = n + ".js";\n`;
+      header += `      script.src = name + ".js";\n`;
       header += `      script.onload = function() {\n`;
-      header += `        ${GLOBAL_NS}.chunks[n] = true;\n`;
+      header += `        ${GLOBAL_NS}.chunks[name] = true;\n`;
       header += `        resolve();\n`;
       header += `      };\n`;
       header += `      script.onerror = reject;\n`;
       header += `      document.head.appendChild(script);\n`;
       header += `    });\n`;
-      header += `    return ${GLOBAL_NS}.chunkPromises[n];\n`;
       header += `  };\n`;
-      header += `  var prereqs = [];\n`;
-      header += `  if (${GLOBAL_NS}.manifest && ${GLOBAL_NS}.manifest.chunks && ${GLOBAL_NS}.manifest.chunks[name]) {\n`;
-      header += `    prereqs = ${GLOBAL_NS}.manifest.chunks[name].dependencies || [];\n`;
-      header += `  }\n`;
-      header += `  var preloads = prereqs.map(function(p) { return loadOne(p); });\n`;
-      header += `  ${GLOBAL_NS}.chunkPromises[name] = Promise.all(preloads).then(function() { return loadOne(name); });\n`;
+      header += `  var depPromises = deps.map(function(d) { return ${GLOBAL_NS}.loadChunk(d); });\n`;
+      header += `  ${GLOBAL_NS}.chunkPromises[name] = Promise.all(depPromises).then(loadSelf);\n`;
       header += `  return ${GLOBAL_NS}.chunkPromises[name];\n`;
       header += `};\n\n`;
 
@@ -689,19 +700,20 @@ class Bundler {
 
   _writeDemoPage(results) {
     const manifest = results.find((r) => r.isManifest)?.manifest || this.manifest || null;
+    const manifestJson = manifest ? JSON.stringify(manifest, null, 2) : 'null';
+
     const chunkList = results
       .filter((r) => !r.isManifest)
       .map((r) => {
-        const modules = (manifest && manifest.chunks && manifest.chunks[r.name]?.modules) || [];
-        const deps = (manifest && manifest.chunks && manifest.chunks[r.name]?.dependencies) || [];
+        const m = (manifest && manifest.chunks && manifest.chunks[r.name]) || {};
         return {
           name: r.name,
           sizeKB: (Buffer.byteLength(r.code, 'utf-8') / 1024).toFixed(2),
           isEntry: !!r.isEntry,
           isShared: !!r.isShared,
-          moduleCount: modules.length,
-          modules,
-          dependencies: deps,
+          moduleCount: (m.modules || []).length,
+          modules: m.modules || [],
+          dependencies: m.dependencies || [],
         };
       });
 
@@ -774,7 +786,15 @@ class Bundler {
   <div class="log-panel" id="log-panel"></div>
 </div>
 
-<script src="manifest.js" onerror="this.remove()"></script>
+<script>
+(function() {
+  var __MANIFEST__ = ${manifestJson};
+  if (typeof window !== 'undefined') {
+    window.__mini_pack = window.__mini_pack || {};
+    window.__mini_pack.manifest = __MANIFEST__;
+  }
+})();
+</script>
 <script>
 (function() {
   var panel = document.getElementById('log-panel');
@@ -811,56 +831,159 @@ class Bundler {
 
   window.addEventListener('error', function(e) {
     addLog('error', ['[Window Error]', e.message, '(' + e.filename + ':' + e.lineno + ')']);
-    statusLabel.textContent = 'Error: ' + e.message;
-    statusLabel.className = 'status error';
+    if (statusLabel) {
+      statusLabel.textContent = 'Error: ' + e.message;
+      statusLabel.className = 'status error';
+    }
   });
 
   window.addEventListener('unhandledrejection', function(e) {
     addLog('error', ['[Unhandled Promise]', String(e.reason)]);
-    statusLabel.textContent = 'Promise rejection: ' + String(e.reason);
-    statusLabel.className = 'status error';
+    if (statusLabel) {
+      statusLabel.textContent = 'Promise rejection: ' + String(e.reason);
+      statusLabel.className = 'status error';
+    }
   });
+
+  function topoSortChunks(manifest) {
+    if (!manifest || !manifest.chunks) return [];
+    var inDegree = {};
+    var graph = {};
+    var names = Object.keys(manifest.chunks);
+    names.forEach(function(n) { inDegree[n] = 0; graph[n] = []; });
+    names.forEach(function(n) {
+      var deps = manifest.chunks[n].dependencies || [];
+      deps.forEach(function(d) {
+        if (graph[d]) { graph[d].push(n); inDegree[n] = (inDegree[n] || 0) + 1; }
+      });
+    });
+    var queue = names.filter(function(n) { return inDegree[n] === 0; });
+    var result = [];
+    while (queue.length > 0) {
+      var cur = queue.shift();
+      result.push(cur);
+      (graph[cur] || []).forEach(function(next) {
+        inDegree[next]--;
+        if (inDegree[next] === 0) queue.push(next);
+      });
+    }
+    if (result.length !== names.length) {
+      addLog('warn', ['Chunk dependency cycle detected! Falling back to natural order.']);
+      return names;
+    }
+    return result;
+  }
+
+  function loadScript(name) {
+    return new Promise(function(resolve, reject) {
+      var ns = window.__mini_pack || {};
+      if (ns.chunks && ns.chunks[name]) { resolve(); return; }
+      if (ns.chunkPromises && ns.chunkPromises[name]) { ns.chunkPromises[name].then(resolve, reject); return; }
+      var script = document.createElement('script');
+      script.src = name + '.js';
+      script.onload = function() {
+        if (window.__mini_pack) {
+          window.__mini_pack.chunks = window.__mini_pack.chunks || {};
+          window.__mini_pack.chunks[name] = true;
+        }
+        resolve();
+      };
+      script.onerror = function() { reject(new Error('Failed to load ' + name + '.js')); };
+      document.head.appendChild(script);
+    });
+  }
+
+  function loadChunksInOrder(orderedNames) {
+    var p = Promise.resolve();
+    orderedNames.forEach(function(n) {
+      p = p.then(function() {
+        addLog('info', ['Loading chunk: ' + n + '.js ...']);
+        return loadScript(n);
+      });
+    });
+    return p;
+  }
+
+  function bootstrapEntry() {
+    var ns = window.__mini_pack;
+    if (!ns || !ns.require || !ns.manifest) return null;
+    var entryName = null, entryId = null;
+    for (var n in ns.manifest.chunks) {
+      if (ns.manifest.chunks.hasOwnProperty(n) && ns.manifest.chunks[n].isEntry) {
+        entryName = n;
+        entryId = ns.manifest.chunks[n].entryModuleId;
+        break;
+      }
+    }
+    if (entryId == null) return null;
+    addLog('info', ['Bootstrapping entry chunk ' + entryName + ' (module ' + entryId + ')...']);
+    try {
+      var exp = ns.require(entryId);
+      if (typeof exp === 'object' && exp) {
+        for (var k in exp) {
+          if (exp.hasOwnProperty(k) && typeof exp[k] === 'function') {
+            window[k] = exp[k];
+          }
+        }
+      }
+      return exp;
+    } catch (e) {
+      addLog('error', ['Entry bootstrap failed:', e.message || e]);
+      throw e;
+    }
+  }
+
+  function loadDashboard(attemptLabel) {
+    var ns = window.__mini_pack;
+    if (!ns) { addLog('error', ['__mini_pack runtime not initialized']); return Promise.reject(); }
+    addLog('info', ['— Triggering dashboard load (' + attemptLabel + ')... —']);
+    var chunkName = 'dashboard';
+    if (!ns.manifest || !ns.manifest.chunks || !ns.manifest.chunks[chunkName]) {
+      addLog('error', ['Manifest has no info for chunk: ' + chunkName]);
+      return Promise.reject();
+    }
+    var dashInfo = ns.manifest.chunks[chunkName];
+    var entryId = dashInfo.entryModuleId;
+    var loadPromise;
+    if (ns.loadChunk) {
+      loadPromise = ns.loadChunk(chunkName);
+    } else {
+      var deps = dashInfo.dependencies || [];
+      loadPromise = Promise.all(deps.map(function(d) { return loadScript(d); })).then(function() { return loadScript(chunkName); });
+    }
+    return loadPromise.then(function() {
+      addLog('info', ['Dashboard chunk ready. Requiring entry module ' + entryId + ' and calling init()...']);
+      if (!ns.require) { addLog('error', ['__mini_pack.require missing']); return; }
+      var dashExports = ns.require(entryId);
+      if (dashExports && typeof dashExports.init === 'function') {
+        dashExports.init();
+      }
+      return dashExports;
+    }).then(function(exports) {
+      if (statusLabel) {
+        statusLabel.textContent = 'Dashboard loaded successfully (' + attemptLabel + ')';
+        statusLabel.className = 'status';
+      }
+      addLog('info', ['— Dashboard promise resolved —']);
+      return exports;
+    }).catch(function(err) {
+      addLog('error', ['Dashboard load failed:', err.message || err]);
+      if (statusLabel) {
+        statusLabel.textContent = 'Failed: ' + (err.message || err);
+        statusLabel.className = 'status error';
+      }
+      throw err;
+    });
+  }
 
   var btn1 = document.getElementById('btn-dashboard');
   var btn2 = document.getElementById('btn-dashboard-again');
   var btn3 = document.getElementById('btn-check-cache');
   var btn4 = document.getElementById('btn-clear-log');
 
-  btn1.addEventListener('click', function() {
-    addLog('info', ['— Triggering loadDashboard()... —']);
-    if (window.loadDashboard) {
-      window.loadDashboard().then(function() {
-        statusLabel.textContent = 'Dashboard loaded successfully';
-        statusLabel.className = 'status';
-        addLog('info', ['— Dashboard load promise resolved —']);
-      }).catch(function(err) {
-        addLog('error', ['Dashboard load failed:', err.message || err]);
-        statusLabel.textContent = 'Failed: ' + (err.message || err);
-        statusLabel.className = 'status error';
-      });
-    } else {
-      addLog('warn', ['loadDashboard not exposed globally — calling __mini_pack.require for module 4...']);
-      // Fallback: re-execute entry module via exposed require
-      if (window.__mini_pack && window.__mini_pack.require) {
-        window.__mini_pack.require(4);
-      }
-    }
-  });
-
-  btn2.addEventListener('click', function() {
-    addLog('info', ['— Triggering loadDashboard() again (should hit chunk cache) —']);
-    if (window.loadDashboard) {
-      window.loadDashboard().then(function() {
-        statusLabel.textContent = 'Dashboard loaded again (from cache)';
-        statusLabel.className = 'status';
-        addLog('info', ['— Second dashboard load resolved —']);
-      });
-    } else if (window.__mini_pack && window.__mini_pack.require) {
-      window.__mini_pack.require(4);
-    }
-  });
-
-  btn3.addEventListener('click', function() {
+  if (btn1) btn1.addEventListener('click', function() { loadDashboard('first'); });
+  if (btn2) btn2.addEventListener('click', function() { loadDashboard('cached'); });
+  if (btn3) btn3.addEventListener('click', function() {
     var ns = window.__mini_pack || {};
     addLog('info', ['=== Module Cache State ===']);
     addLog('log', ['Chunks loaded:', Object.keys(ns.chunks || {}).join(', ') || '(none)']);
@@ -880,41 +1003,33 @@ class Bundler {
       for (var cname in ns.manifest.chunks) {
         if (ns.manifest.chunks.hasOwnProperty(cname)) {
           var c = ns.manifest.chunks[cname];
-          addLog('log', ['  ' + cname + ' → deps: [' + (c.dependencies || []).join(', ') + '], modules: ' + (c.modules || []).length]);
+          addLog('log', ['  ' + cname + ' → deps: [' + (c.dependencies || []).join(', ') + '], modules: ' + (c.modules || []).length + ', entryId: ' + (c.entryModuleId != null ? c.entryModuleId : '(none)')]);
         }
       }
     }
-    statusLabel.textContent = 'Cache inspected — check console above';
-    statusLabel.className = 'status';
-  });
-
-  btn4.addEventListener('click', function() {
-    panel.innerHTML = '';
-  });
-
-  addLog('info', ['=== main.js loaded by <script> tag, side-effects and static deps executing... ===']);
-})();
-</script>
-<script src="main.js"></script>
-<script>
-(function() {
-  var ns = window.__mini_pack;
-  if (ns && ns.require) {
-    var entryId = 4;
-    try {
-      ns.require(entryId);
-      var mod4 = ns.cache[entryId];
-      if (mod4) {
-        Object.keys(mod4).forEach(function(k) {
-          if (typeof mod4[k] === 'function') {
-            window[k] = mod4[k];
-          }
-        });
-      }
-    } catch (e) {
-      console.error('Bootstrap error:', e);
+    if (statusLabel) {
+      statusLabel.textContent = 'Cache inspected — check console above';
+      statusLabel.className = 'status';
     }
-  }
+  });
+  if (btn4) btn4.addEventListener('click', function() { panel.innerHTML = ''; });
+
+  addLog('info', ['=== Demo page bootstrap starting... ===']);
+
+  var ordered = topoSortChunks(window.__mini_pack && window.__mini_pack.manifest);
+  addLog('log', ['Chunk load order (from manifest):', ordered.join(' → ')]);
+
+  loadChunksInOrder(ordered).then(function() {
+    addLog('info', ['All entry chunks loaded. Bootstrapping entry module...']);
+    bootstrapEntry();
+    if (statusLabel) {
+      statusLabel.textContent = 'Ready — main has executed, you can load dashboard now';
+      statusLabel.className = 'status';
+    }
+    addLog('info', ['=== Bootstrap complete ===']);
+  }).catch(function(err) {
+    addLog('error', ['Bootstrap failed:', err.message || err]);
+  });
 })();
 </script>
 </body>
