@@ -8,6 +8,7 @@ const DependencyResolver = require('./resolver');
 const ModuleGraph = require('./module-graph');
 const Optimizer = require('./optimizer');
 const Bundler = require('./bundler');
+const { SourceMapConsumer } = require('./source-map');
 
 class BuildPipeline {
   constructor(options = {}) {
@@ -59,7 +60,16 @@ class BuildPipeline {
       const optimizer = new Optimizer(this.graph);
       optimizer.optimize();
       const optStats = optimizer.getStats();
-      this._log(`Tree-shaking: removed ${optStats.exportsRemoved} unused exports from ${optStats.modulesOptimized} modules`);
+      console.log(`[mini-pack] Tree-shaking: removed ${optStats.exportsRemoved} unused exports from ${optStats.modulesOptimized} modules`);
+      const byMod = optStats.deadExportsByModule || {};
+      const keys = Object.keys(byMod);
+      if (keys.length > 0) {
+        for (const k of keys) {
+          const rel = path.relative(process.cwd(), k).replace(/\\/g, '/');
+          const names = byMod[k].join(', ');
+          console.log(`  - ${rel}: removed [ ${names} ]`);
+        }
+      }
     }
 
     const bundler = new Bundler(this.graph, {
@@ -69,9 +79,9 @@ class BuildPipeline {
       format: this.format,
     });
 
-    const results = bundler.bundle();
+    const bundleResults = bundler.bundle();
 
-    await bundler.writeBundles(results);
+    const results = await bundler.writeBundles(bundleResults);
 
     const buildTime = Date.now() - startTime;
     this.lastBuildTime = buildTime;
@@ -79,6 +89,18 @@ class BuildPipeline {
 
     console.log(`[mini-pack] Build completed in ${buildTime}ms`);
     for (const result of results) {
+      if (result.isManifest) {
+        const stat = fs.statSync(result.outputPath);
+        const sizeKB = (stat.size / 1024).toFixed(2);
+        console.log(`  manifest.json (${sizeKB} KB) [manifest]`);
+        continue;
+      }
+      if (result.outputPath && result.outputPath.endsWith('.html')) {
+        const stat = fs.statSync(result.outputPath);
+        const sizeKB = (stat.size / 1024).toFixed(2);
+        console.log(`  index.html (${sizeKB} KB) [demo page]`);
+        continue;
+      }
       const size = Buffer.byteLength(result.code, 'utf-8');
       const sizeKB = (size / 1024).toFixed(2);
       console.log(`  ${result.name}.js (${sizeKB} KB)${result.isEntry ? ' [entry]' : ''}${result.isShared ? ' [shared]' : ''}`);
@@ -98,7 +120,16 @@ class BuildPipeline {
       const optimizer = new Optimizer(this.graph);
       optimizer.optimize();
       const optStats = optimizer.getStats();
-      this._log(`Tree-shaking: removed ${optStats.exportsRemoved} unused exports`);
+      console.log(`[mini-pack] Tree-shaking: removed ${optStats.exportsRemoved} unused exports`);
+      const byMod = optStats.deadExportsByModule || {};
+      const keys = Object.keys(byMod);
+      if (keys.length > 0) {
+        for (const k of keys) {
+          const rel = path.relative(process.cwd(), k).replace(/\\/g, '/');
+          const names = byMod[k].join(', ');
+          console.log(`  - ${rel}: removed [ ${names} ]`);
+        }
+      }
     }
 
     const bundler = new Bundler(this.graph, {
@@ -350,6 +381,126 @@ program
 
     console.log('\n=== Topological Order ===\n');
     console.log(topoOrder.map((p) => path.relative(process.cwd(), p)).join('\n  '));
+  });
+
+program
+  .command('sourcemap')
+  .description('Verify source map: given bundled file + line/col, return original file and line')
+  .requiredOption('-f, --file <path>', 'Bundled JS file path (e.g. dist/main.js)')
+  .requiredOption('-l, --line <num>', 'Line number in bundled file (1-based)', parseInt)
+  .option('-c, --column <num>', 'Column number in bundled file (0-based)', parseInt, 0)
+  .option('--show-context', 'Show surrounding lines of original source')
+  .action((options) => {
+    const bundleAbs = path.resolve(options.file);
+    if (!fs.existsSync(bundleAbs)) {
+      console.error(`[mini-pack] Error: Bundle file not found: ${bundleAbs}`);
+      process.exit(1);
+    }
+
+    const bundleDir = path.dirname(bundleAbs);
+    const bundleName = path.basename(bundleAbs);
+    const code = fs.readFileSync(bundleAbs, 'utf-8');
+    const codeLines = code.split('\n');
+
+    if (options.line < 1 || options.line > codeLines.length) {
+      console.error(`[mini-pack] Error: line ${options.line} out of range (bundle has ${codeLines.length} lines)`);
+      process.exit(1);
+    }
+
+    let mapPath = bundleAbs + '.map';
+    let mapData = null;
+
+    if (fs.existsSync(mapPath)) {
+      mapData = JSON.parse(fs.readFileSync(mapPath, 'utf-8'));
+    } else {
+      const inlineMatch = code.match(/\/\/# sourceMappingURL=data:application\/json;charset=utf-8;base64,([A-Za-z0-9+/=]+)/);
+      if (inlineMatch) {
+        try {
+          const decoded = Buffer.from(inlineMatch[1], 'base64').toString('utf-8');
+          mapData = JSON.parse(decoded);
+        } catch (err) {
+          console.error('[mini-pack] Error: Failed to decode inline source map:', err.message);
+          process.exit(1);
+        }
+      }
+    }
+
+    if (!mapData) {
+      console.error(`[mini-pack] Error: No source map found for ${bundleAbs} (tried ${mapPath} and inline)`);
+      process.exit(1);
+    }
+
+    const consumer = new SourceMapConsumer(mapData);
+
+    const targetLine = options.line;
+    const targetCol = options.column;
+    const pos = consumer.originalPositionFor({ line: targetLine, column: targetCol });
+
+    console.log('\n=== Source Map Verification ===\n');
+    console.log(`Bundle file : ${bundleName}`);
+    console.log(`Query       : line ${targetLine}, col ${targetCol}`);
+    console.log(`Bundle line : ${JSON.stringify(codeLines[targetLine - 1] || '')}`);
+    console.log('');
+
+    if (!pos.source) {
+      console.log('Result      : ❌ No mapping found for this position');
+      console.log('              (This usually means the position is inside runtime wrapper');
+      console.log('               or helper code with no original source mapping)');
+
+      let found = null;
+      let nearestLine = null;
+      for (let l = targetLine; l >= 1; l--) {
+        const p = consumer.originalPositionFor({ line: l, column: 0 });
+        if (p.source) { found = p; nearestLine = l; break; }
+      }
+      if (found) {
+        console.log(`\nNearest earlier mapping is at bundle line ${nearestLine}:`);
+        printMapping(found, bundleDir, options.showContext);
+      }
+      console.log('');
+      process.exit(0);
+    }
+
+    console.log('Result      : ✅ Mapping found!');
+    console.log('');
+    printMapping(pos, bundleDir, options.showContext);
+
+    if (pos.source && mapData.sourcesContent) {
+      const sourceIdx = mapData.sources.indexOf(pos.source);
+      if (sourceIdx >= 0 && mapData.sourcesContent[sourceIdx]) {
+        const origLines = mapData.sourcesContent[sourceIdx].split(/\r?\n/);
+        const origLine = pos.line;
+        const from = Math.max(1, origLine - 2);
+        const to = Math.min(origLines.length, origLine + 2);
+        console.log('\n=== Original Source Context (from sourcesContent) ===\n');
+        for (let i = from; i <= to; i++) {
+          const marker = i === origLine ? ' -> ' : '    ';
+          const lineStr = String(i).padStart(4, ' ');
+          console.log(`${marker}${lineStr} | ${origLines[i - 1] || ''}`);
+        }
+      }
+    }
+    console.log('');
+
+    function printMapping(p, baseDir, showCtx) {
+      const absSource = path.resolve(baseDir, p.source);
+      console.log(`Source file : ${p.source}`);
+      console.log(`Abs path    : ${absSource}`);
+      console.log(`Original L/C: line ${p.line}, col ${p.column}`);
+      if (p.name) console.log(`Symbol name : ${p.name}`);
+
+      if (showCtx && fs.existsSync(absSource)) {
+        const srcLines = fs.readFileSync(absSource, 'utf-8').split(/\r?\n/);
+        const from = Math.max(1, p.line - 2);
+        const to = Math.min(srcLines.length, p.line + 2);
+        console.log('\n=== Original Source Context (disk) ===\n');
+        for (let i = from; i <= to; i++) {
+          const marker = i === p.line ? ' -> ' : '    ';
+          const lineStr = String(i).padStart(4, ' ');
+          console.log(`${marker}${lineStr} | ${srcLines[i - 1] || ''}`);
+        }
+      }
+    }
   });
 
 if (process.argv.length <= 2) {

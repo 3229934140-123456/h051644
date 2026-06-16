@@ -19,3 +19,7 @@ async function loadDashboard() {
 }
 
 loadDashboard();
+
+if (typeof globalThis !== 'undefined') {
+  globalThis.loadDashboard = loadDashboard;
+}
