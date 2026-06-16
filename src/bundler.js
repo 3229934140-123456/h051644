@@ -1,7 +1,10 @@
 const path = require('path');
 const fs = require('fs');
 const fse = require('fs-extra');
+const acorn = require('acorn');
 const { SourceMapGenerator } = require('./source-map');
+
+const GLOBAL_NS = '__mini_pack';
 
 class Bundler {
   constructor(moduleGraph, options = {}) {
@@ -33,11 +36,9 @@ class Bundler {
   }
 
   _identifyChunks() {
-    const mainEntryModules = new Set(this.graph.entries);
     const dynamicEntryModules = new Set(this.graph.dynamicEntries);
 
     const mainModules = new Set();
-    const chunkModules = new Map();
 
     const collectStaticDeps = (filePath, moduleSet, visited = new Set()) => {
       if (visited.has(filePath)) return;
@@ -139,12 +140,14 @@ class Bundler {
         })
       : null;
 
-    const moduleWrappers = [];
     const topoOrder = this.graph.topologicalSort();
-
     const sortedModulePaths = topoOrder.filter((p) => chunk.modules.has(p));
 
+    const moduleWrappers = [];
     let generatedLine = 1;
+
+    const runtimeHeader = this._generateRuntimeHeader(chunkName, chunk);
+    generatedLine += runtimeHeader.split('\n').length;
 
     for (const filePath of sortedModulePaths) {
       const mod = this.graph.getModule(filePath);
@@ -154,40 +157,40 @@ class Bundler {
       const relativePath = path.relative(process.cwd(), filePath).replace(/\\/g, '/');
 
       if (sourceMap) {
-        sourceMap.addSourceContent(relativePath, mod.code);
+        sourceMap.addSourceContent(relativePath, this._getOriginalSource(filePath, mod));
       }
 
-      const { wrapperCode, lineCount } = this._wrapModule(
-        mod,
-        moduleId,
-        filePath,
-        sourceMap,
-        generatedLine,
-        relativePath
+      const { wrapperCode, lineMappings } = this._wrapModule(
+        mod, moduleId, filePath, relativePath
       );
 
+      if (sourceMap && lineMappings) {
+        const wrapperPrefix = `var ${GLOBAL_NS} = ${GLOBAL_NS} || {};\n${GLOBAL_NS}.modules = ${GLOBAL_NS}.modules || {};\n${GLOBAL_NS}.modules[${moduleId}] = function(__exports, __require) {\n`;
+        const headerLineCount = wrapperPrefix.split('\n').length;
+
+        for (const mapping of lineMappings) {
+          sourceMap.addMapping({
+            generated: { line: generatedLine + headerLineCount - 1 + mapping.generatedLine, column: mapping.generatedColumn || 0 },
+            original: { line: mapping.originalLine, column: mapping.originalColumn || 0 },
+            source: relativePath,
+          });
+        }
+      }
+
       moduleWrappers.push(wrapperCode);
-      generatedLine += lineCount;
+      generatedLine += wrapperCode.split('\n').length;
     }
 
-    const chunkImports = this._generateChunkImports(chunkName, chunk);
-
-    let output = '';
-    if (chunkImports) {
-      output += chunkImports + '\n';
-    }
-
-    output += this._generateRuntime(chunkName, chunk);
+    let output = runtimeHeader;
 
     for (const wrapper of moduleWrappers) {
       output += wrapper + '\n';
     }
 
-    output += this._generateEntryCall(chunkName, chunk, sortedModulePaths);
+    output += this._generateBootstrap(chunkName, chunk, sortedModulePaths);
 
     if (sourceMap) {
-      const comment = sourceMap.toComment();
-      output += '\n' + comment;
+      output += '\n' + sourceMap.toComment();
     }
 
     return {
@@ -200,92 +203,148 @@ class Bundler {
     };
   }
 
-  _wrapModule(mod, moduleId, filePath, sourceMap, startLine, relativePath) {
-    const deps = mod.imports
-      .filter((imp) => imp.resolvedPath)
-      .map((imp) => {
-        const depId = this.moduleIdMap.get(imp.resolvedPath);
-        const specifierNames = imp.specifiers.map((s) => s.local);
-        return { id: depId, names: specifierNames };
-      });
+  _getOriginalSource(filePath, mod) {
+    try {
+      return fs.readFileSync(filePath, 'utf-8');
+    } catch {
+      return mod.code;
+    }
+  }
 
-    const transformedCode = this._transformModuleCode(mod, moduleId);
+  _generateRuntimeHeader(chunkName, chunk) {
+    if (chunk.isEntry) {
+      let header = '';
+      header += `var ${GLOBAL_NS} = ${GLOBAL_NS} || {};\n`;
+      header += `${GLOBAL_NS}.modules = ${GLOBAL_NS}.modules || {};\n`;
+      header += `${GLOBAL_NS}.cache = ${GLOBAL_NS}.cache || {};\n`;
+      header += `${GLOBAL_NS}.chunks = ${GLOBAL_NS}.chunks || {};\n`;
+      header += `${GLOBAL_NS}.chunkPromises = ${GLOBAL_NS}.chunkPromises || {};\n\n`;
 
-    if (sourceMap) {
-      const codeLines = transformedCode.split('\n');
-      for (let i = 0; i < codeLines.length; i++) {
-        const originalLine = this._findOriginalLine(mod, i + 1);
-        if (originalLine) {
-          sourceMap.addMapping({
-            generated: { line: startLine + 2 + i, column: 0 },
-            original: { line: originalLine, column: 0 },
-            source: relativePath,
-          });
-        }
-      }
+      header += `${GLOBAL_NS}.loadChunk = ${GLOBAL_NS}.loadChunk || function(name) {\n`;
+      header += `  if (${GLOBAL_NS}.chunks[name]) return Promise.resolve();\n`;
+      header += `  if (${GLOBAL_NS}.chunkPromises[name]) return ${GLOBAL_NS}.chunkPromises[name];\n`;
+      header += `  ${GLOBAL_NS}.chunkPromises[name] = new Promise(function(resolve, reject) {\n`;
+      header += `    var script = document.createElement("script");\n`;
+      header += `    script.src = name + ".js";\n`;
+      header += `    script.onload = function() {\n`;
+      header += `      ${GLOBAL_NS}.chunks[name] = true;\n`;
+      header += `      resolve();\n`;
+      header += `    };\n`;
+      header += `    script.onerror = reject;\n`;
+      header += `    document.head.appendChild(script);\n`;
+      header += `  });\n`;
+      header += `  return ${GLOBAL_NS}.chunkPromises[name];\n`;
+      header += `};\n\n`;
+
+      header += `var __require = ${GLOBAL_NS}.require = ${GLOBAL_NS}.require || function(id) {\n`;
+      header += `  if (${GLOBAL_NS}.cache[id]) return ${GLOBAL_NS}.cache[id];\n`;
+      header += `  var __exports = {};\n`;
+      header += `  ${GLOBAL_NS}.cache[id] = __exports;\n`;
+      header += `  if (${GLOBAL_NS}.modules[id]) {\n`;
+      header += `    ${GLOBAL_NS}.modules[id](__exports, __require);\n`;
+      header += `  }\n`;
+      header += `  return __exports;\n`;
+      header += `};\n\n`;
+
+      return header;
     }
 
-    const wrapperCode = `__modules[${moduleId}] = function(__exports, __require) {\n${transformedCode}\n};`;
+    let header = '';
+    header += `var ${GLOBAL_NS} = ${GLOBAL_NS} || {};\n`;
+    header += `${GLOBAL_NS}.modules = ${GLOBAL_NS}.modules || {};\n`;
+    header += `${GLOBAL_NS}.cache = ${GLOBAL_NS}.cache || {};\n`;
+    header += `var __require = ${GLOBAL_NS}.require || function(id) {\n`;
+    header += `  if (${GLOBAL_NS}.cache[id]) return ${GLOBAL_NS}.cache[id];\n`;
+    header += `  var __exports = {};\n`;
+    header += `  ${GLOBAL_NS}.cache[id] = __exports;\n`;
+    header += `  if (${GLOBAL_NS}.modules[id]) {\n`;
+    header += `    ${GLOBAL_NS}.modules[id](__exports, __require);\n`;
+    header += `  }\n`;
+    header += `  return __exports;\n`;
+    header += `};\n\n`;
+    return header;
+  }
 
-    const lineCount = wrapperCode.split('\n').length;
+  _wrapModule(mod, moduleId, filePath, relativePath) {
+    const { transformedCode, lineMappings } = this._transformModuleCode(mod, moduleId);
 
-    return { wrapperCode, lineCount };
+    const wrapperCode = `var ${GLOBAL_NS} = ${GLOBAL_NS} || {};\n${GLOBAL_NS}.modules = ${GLOBAL_NS}.modules || {};\n${GLOBAL_NS}.modules[${moduleId}] = function(__exports, __require) {\n${transformedCode}\n};\n`;
+
+    return { wrapperCode, lineMappings };
   }
 
   _transformModuleCode(mod, moduleId) {
+    const originalCode = this._getOriginalSource(mod.filePath, mod);
+    const lineMappings = [];
+
     let code = mod.code;
 
-    const importReplacements = [];
+    const { code: afterImports, sideEffectRequires, removedImportLines } = this._removeImportDeclarations(code, mod);
 
-    for (const imp of mod.imports) {
-      if (!imp.resolvedPath) continue;
-      const depId = this.moduleIdMap.get(imp.resolvedPath);
+    code = afterImports;
 
-      for (const spec of imp.specifiers) {
-        if (spec.type === 'namespace') {
-          importReplacements.push({
-            original: spec.local,
-            replacement: `__require(${depId})`,
-            type: 'namespace',
-          });
-        } else if (spec.type === 'default') {
-          importReplacements.push({
-            original: spec.local,
-            replacement: `__require(${depId}).default`,
-            type: 'default',
-          });
-        } else if (spec.type === 'named') {
-          importReplacements.push({
-            original: spec.local,
-            replacement: `__require(${depId}).${spec.imported}`,
-            type: 'named',
-            imported: spec.imported,
-          });
-        }
-      }
-    }
+    const { code: afterExports } = this._transformExportDeclarations(code, mod);
 
-    code = this._removeImportDeclarations(code);
-
-    code = this._transformExportDeclarations(code, mod);
+    code = afterExports;
 
     code = this._transformDynamicImports(code, mod);
+
+    const importReplacements = this._buildImportReplacements(mod);
 
     for (const rep of importReplacements) {
       const regex = new RegExp(`\\b${this._escapeRegex(rep.original)}\\b`, 'g');
       code = code.replace(regex, rep.replacement);
     }
 
-    return code;
+    if (sideEffectRequires.length > 0) {
+      code = sideEffectRequires.join('\n') + '\n' + code;
+    }
+
+    const originalCodeLines = originalCode.split('\n');
+    const originalLineUsed = new Set();
+    for (let i = 1; i <= originalCodeLines.length; i++) {
+      originalLineUsed.add(i);
+    }
+    for (const removedLine of removedImportLines) {
+      originalLineUsed.delete(removedLine);
+    }
+
+    const originalLineNumbers = Array.from(originalLineUsed).sort((a, b) => a - b);
+
+    const transformedLines = code.split('\n');
+    const sideEffectOffset = sideEffectRequires.length;
+
+    for (let i = 0; i < transformedLines.length; i++) {
+      const transformedLineNum = i + 1;
+      let originalLine;
+
+      if (transformedLineNum <= sideEffectOffset) {
+        originalLine = 1;
+      } else {
+        const codeLineIdx = transformedLineNum - sideEffectOffset - 1;
+        if (codeLineIdx < originalLineNumbers.length) {
+          originalLine = originalLineNumbers[codeLineIdx];
+        } else {
+          originalLine = originalCodeLines.length;
+        }
+      }
+
+      lineMappings.push({
+        generatedLine: transformedLineNum,
+        generatedColumn: 0,
+        originalLine: originalLine,
+        originalColumn: 0,
+      });
+    }
+
+    return { transformedCode: code, lineMappings };
   }
 
-  _escapeRegex(str) {
-    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  }
+  _removeImportDeclarations(code, mod) {
+    const sideEffectRequires = [];
+    const removedImportLines = [];
 
-  _removeImportDeclarations(code) {
     try {
-      const acorn = require('acorn');
       const ast = acorn.parse(code, {
         sourceType: 'module',
         ecmaVersion: 'latest',
@@ -296,7 +355,26 @@ class Bundler {
         (node) => node.type === 'ImportDeclaration'
       );
 
-      if (importNodes.length === 0) return code;
+      if (importNodes.length === 0) return { code, sideEffectRequires, removedImportLines };
+
+      for (const node of importNodes) {
+        const source = node.source.value;
+        const depInfo = mod.imports.find((imp) => imp.source === source);
+        if (depInfo && depInfo.resolvedPath) {
+          const depId = this.moduleIdMap.get(depInfo.resolvedPath);
+          if (node.specifiers.length === 0) {
+            sideEffectRequires.push(`__require(${depId});`);
+          }
+        }
+
+        if (node.loc) {
+          const startLine = node.loc.start.line;
+          const endLine = node.loc.end.line;
+          for (let l = startLine; l <= endLine; l++) {
+            removedImportLines.push(l);
+          }
+        }
+      }
 
       let result = code;
       for (let i = importNodes.length - 1; i >= 0; i--) {
@@ -304,15 +382,32 @@ class Bundler {
         result = result.slice(0, node.start) + result.slice(node.end);
       }
 
-      return result;
+      return { code: result, sideEffectRequires, removedImportLines };
     } catch {
-      return code.replace(/^import\s+.*?['"].*?['"];?\s*$/gm, '');
+      const lines = code.split('\n');
+      const resultLines = [];
+      for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+        const line = lines[lineIdx];
+        if (/^import\s+/.test(line.trim())) {
+          removedImportLines.push(lineIdx + 1);
+          const match = line.match(/^import\s+['"]([^'"]+)['"]/);
+          if (match) {
+            const depInfo = mod.imports.find((imp) => imp.source === match[1]);
+            if (depInfo && depInfo.resolvedPath) {
+              const depId = this.moduleIdMap.get(depInfo.resolvedPath);
+              sideEffectRequires.push(`__require(${depId});`);
+            }
+          }
+        } else {
+          resultLines.push(line);
+        }
+      }
+      return { code: resultLines.join('\n'), sideEffectRequires, removedImportLines };
     }
   }
 
   _transformExportDeclarations(code, mod) {
     try {
-      const acorn = require('acorn');
       const ast = acorn.parse(code, {
         sourceType: 'module',
         ecmaVersion: 'latest',
@@ -327,7 +422,8 @@ class Bundler {
             replacements.push({
               start: node.start,
               end: node.end,
-              replacement: `Object.defineProperty(__exports, 'default', { enumerable: true, get: () => ${node.declaration.name} });`,
+              replacement: `Object.defineProperty(__exports, 'default', { enumerable: true, get: function() { return ${node.declaration.name}; } });`,
+              originalLoc: node.loc,
             });
           } else if (node.declaration.type === 'FunctionDeclaration') {
             const name = node.declaration.id ? node.declaration.id.name : '__default';
@@ -335,7 +431,8 @@ class Bundler {
             replacements.push({
               start: node.start,
               end: node.end,
-              replacement: `${funcBody}\nObject.defineProperty(__exports, 'default', { enumerable: true, get: () => ${name} });`,
+              replacement: `${funcBody}\nObject.defineProperty(__exports, 'default', { enumerable: true, get: function() { return ${name}; } });`,
+              originalLoc: node.loc,
             });
           } else {
             const decl = code.slice(node.declaration.start, node.declaration.end);
@@ -343,6 +440,7 @@ class Bundler {
               start: node.start,
               end: node.end,
               replacement: `__exports.default = ${decl};`,
+              originalLoc: node.loc,
             });
           }
         } else if (node.type === 'ExportNamedDeclaration') {
@@ -351,12 +449,13 @@ class Bundler {
               const varCode = code.slice(node.declaration.start, node.declaration.end);
               const names = node.declaration.declarations.map((d) => d.id.name);
               const exportDefs = names
-                .map((n) => `Object.defineProperty(__exports, '${n}', { enumerable: true, get: () => ${n} });`)
+                .map((n) => `Object.defineProperty(__exports, '${n}', { enumerable: true, get: function() { return ${n}; } });`)
                 .join('\n');
               replacements.push({
                 start: node.start,
                 end: node.end,
                 replacement: `${varCode}\n${exportDefs}`,
+                originalLoc: node.loc,
               });
             } else if (node.declaration.type === 'FunctionDeclaration') {
               const name = node.declaration.id.name;
@@ -364,7 +463,8 @@ class Bundler {
               replacements.push({
                 start: node.start,
                 end: node.end,
-                replacement: `${funcCode}\nObject.defineProperty(__exports, '${name}', { enumerable: true, get: () => ${name} });`,
+                replacement: `${funcCode}\nObject.defineProperty(__exports, '${name}', { enumerable: true, get: function() { return ${name}; } });`,
+                originalLoc: node.loc,
               });
             } else if (node.declaration.type === 'ClassDeclaration') {
               const name = node.declaration.id.name;
@@ -372,17 +472,19 @@ class Bundler {
               replacements.push({
                 start: node.start,
                 end: node.end,
-                replacement: `${classCode}\nObject.defineProperty(__exports, '${name}', { enumerable: true, get: () => ${name} });`,
+                replacement: `${classCode}\nObject.defineProperty(__exports, '${name}', { enumerable: true, get: function() { return ${name}; } });`,
+                originalLoc: node.loc,
               });
             }
           } else if (node.specifiers && node.specifiers.length > 0) {
             const specDefs = node.specifiers
-              .map((s) => `Object.defineProperty(__exports, '${s.exported.name}', { enumerable: true, get: () => ${s.local.name} });`)
+              .map((s) => `Object.defineProperty(__exports, '${s.exported.name}', { enumerable: true, get: function() { return ${s.local.name}; } });`)
               .join('\n');
             replacements.push({
               start: node.start,
               end: node.end,
               replacement: specDefs,
+              originalLoc: node.loc,
             });
           }
         } else if (node.type === 'ExportAllDeclaration') {
@@ -390,11 +492,12 @@ class Bundler {
             start: node.start,
             end: node.end,
             replacement: `Object.assign(__exports, __require(${this.moduleIdMap.get(node.source.value) || 0}));`,
+            originalLoc: node.loc,
           });
         }
       }
 
-      if (replacements.length === 0) return code;
+      if (replacements.length === 0) return { code, lineOffsetAfterExports: 0 };
 
       replacements.sort((a, b) => b.start - a.start);
       let result = code;
@@ -402,9 +505,9 @@ class Bundler {
         result = result.slice(0, r.start) + r.replacement + result.slice(r.end);
       }
 
-      return result;
+      return { code: result, lineOffsetAfterExports: 0 };
     } catch {
-      return code;
+      return { code, lineOffsetAfterExports: 0 };
     }
   }
 
@@ -422,68 +525,43 @@ class Bundler {
             path.extname(normalized)
           );
           const moduleId = this.moduleIdMap.get(depInfo.resolvedPath);
-          return `__loadChunk('${chunkName}').then(() => __require(${moduleId}))`;
+          return `${GLOBAL_NS}.loadChunk('${chunkName}').then(function() { return __require(${moduleId}); })`;
         }
         return match;
       }
     );
   }
 
-  _findOriginalLine(mod, lineInTransformed) {
-    return lineInTransformed;
-  }
+  _buildImportReplacements(mod) {
+    const importReplacements = [];
+    for (const imp of mod.imports) {
+      if (!imp.resolvedPath) continue;
+      const depId = this.moduleIdMap.get(imp.resolvedPath);
 
-  _generateChunkImports(chunkName, chunk) {
-    if (chunk.isEntry || chunk.isShared) return '';
-
-    const imports = [];
-    const sharedChunk = this.chunks.get('shared');
-    if (sharedChunk && chunkName !== 'shared') {
-      imports.push(`import './shared.js';`);
+      for (const spec of imp.specifiers) {
+        if (spec.type === 'namespace') {
+          importReplacements.push({
+            original: spec.local,
+            replacement: `__require(${depId})`,
+          });
+        } else if (spec.type === 'default') {
+          importReplacements.push({
+            original: spec.local,
+            replacement: `__require(${depId}).default`,
+          });
+        } else if (spec.type === 'named') {
+          importReplacements.push({
+            original: spec.local,
+            replacement: `__require(${depId}).${spec.imported}`,
+          });
+        }
+      }
     }
-
-    return imports.join('\n');
+    return importReplacements;
   }
 
-  _generateRuntime(chunkName, chunk) {
-    let runtime = '';
-    runtime += 'var __chunks = {};\n';
-    runtime += 'var __chunkPromises = {};\n\n';
-
-    runtime += 'function __loadChunk(name) {\n';
-    runtime += '  if (__chunks[name]) return Promise.resolve();\n';
-    runtime += '  if (__chunkPromises[name]) return __chunkPromises[name];\n';
-    runtime += '  __chunkPromises[name] = new Promise(function(resolve, reject) {\n';
-    runtime += '    var script = document.createElement("script");\n';
-    runtime += '    script.src = name + ".js";\n';
-    runtime += '    script.onload = function() {\n';
-    runtime += '      __chunks[name] = true;\n';
-    runtime += '      resolve();\n';
-    runtime += '    };\n';
-    runtime += '    script.onerror = reject;\n';
-    runtime += '    document.head.appendChild(script);\n';
-    runtime += '  });\n';
-    runtime += '  return __chunkPromises[name];\n';
-    runtime += '}\n\n';
-
-    runtime += 'var __modules = {};\n';
-    runtime += 'var __moduleCache = {};\n\n';
-
-    runtime += 'function __require(id) {\n';
-    runtime += '  if (__moduleCache[id]) return __moduleCache[id];\n';
-    runtime += '  var __exports = {};\n';
-    runtime += '  __moduleCache[id] = __exports;\n';
-    runtime += '  if (__modules[id]) {\n';
-    runtime += '    __modules[id](__exports, __require);\n';
-    runtime += '  }\n';
-    runtime += '  return __exports;\n';
-    runtime += '}\n\n';
-
-    return runtime;
-  }
-
-  _generateEntryCall(chunkName, chunk, sortedModulePaths) {
-    let output = '';
+  _generateBootstrap(chunkName, chunk, sortedModulePaths) {
+    let output = '\n';
     if (chunk.isEntry) {
       for (const filePath of sortedModulePaths) {
         const id = this.moduleIdMap.get(filePath);
@@ -494,6 +572,10 @@ class Bundler {
       }
     }
     return output;
+  }
+
+  _escapeRegex(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   async writeBundles(results) {

@@ -1,5 +1,6 @@
 const acorn = require('acorn');
 const walk = require('acorn-walk');
+const path = require('path');
 
 class Optimizer {
   constructor(moduleGraph, options = {}) {
@@ -17,11 +18,15 @@ class Optimizer {
     return this;
   }
 
+  _normalizePath(filePath) {
+    return filePath.replace(/\\/g, '/');
+  }
+
   _collectUsedExports() {
     for (const [filePath, mod] of this.graph.modules) {
       this.usedExports.set(filePath, new Set());
 
-      if (mod.isEntry || mod.isDynamicEntry) {
+      if (mod.isEntry) {
         for (const exp of mod.exports) {
           if (exp.type === 'all') continue;
           this.usedExports.get(filePath).add(exp.name);
@@ -42,12 +47,13 @@ class Optimizer {
         for (const imp of mod.imports) {
           if (!imp.resolvedPath) continue;
 
-          const depPath = imp.resolvedPath.replace(/\\/g, '/');
           const depMod = this.graph.getModule(imp.resolvedPath);
           if (!depMod) continue;
 
-          const usedSet = this.usedExports.get(depPath);
+          const usedSet = this.usedExports.get(imp.resolvedPath);
           if (!usedSet) continue;
+
+          const actuallyUsedNames = this._getActuallyUsedNames(mod, imp);
 
           for (const spec of imp.specifiers) {
             if (spec.type === 'namespace') {
@@ -59,18 +65,22 @@ class Optimizer {
                 }
               }
             } else if (spec.type === 'default') {
-              if (!usedSet.has('default')) {
+              if (!usedSet.has('default') && actuallyUsedNames.has(spec.local)) {
                 usedSet.add('default');
                 depMod.usedExports.add('default');
                 changed = true;
               }
             } else if (spec.type === 'named') {
-              if (!usedSet.has(spec.imported)) {
+              if (!usedSet.has(spec.imported) && actuallyUsedNames.has(spec.local)) {
                 usedSet.add(spec.imported);
                 depMod.usedExports.add(spec.imported);
                 changed = true;
               }
             }
+          }
+
+          if (imp.specifiers.length === 0) {
+            usedSet.add('__sideEffect__');
           }
         }
       }
@@ -83,8 +93,9 @@ class Optimizer {
         if (!depMod) continue;
         const usedSet = this.usedExports.get(dynImp.resolvedPath);
         if (usedSet) {
+          const actuallyUsedDynNames = this._getActuallyUsedDynamicNames(mod, dynImp);
           for (const exp of depMod.exports) {
-            if (exp.type !== 'all' && !usedSet.has(exp.name)) {
+            if (exp.type !== 'all' && !usedSet.has(exp.name) && actuallyUsedDynNames.has(exp.name)) {
               usedSet.add(exp.name);
               depMod.usedExports.add(exp.name);
             }
@@ -92,6 +103,143 @@ class Optimizer {
         }
       }
     }
+  }
+
+  _getActuallyUsedNames(mod, imp) {
+    const usedNames = new Set();
+
+    if (imp.specifiers.length === 0) {
+      return usedNames;
+    }
+
+    try {
+      const code = mod.code;
+      const importedLocals = new Set(imp.specifiers.map((s) => s.local));
+
+      const ast = acorn.parse(code, {
+        sourceType: 'module',
+        ecmaVersion: 'latest',
+        locations: true,
+      });
+
+      const importRanges = [];
+
+      for (const node of ast.body) {
+        if (node.type === 'ImportDeclaration' && node.source.value === imp.source) {
+          for (const spec of node.specifiers) {
+            importRanges.push({
+              name: spec.local.name,
+              start: spec.local.start || spec.local.name ? spec.local.start : node.start,
+              end: spec.local.end || spec.local.name ? spec.local.end : node.end,
+            });
+          }
+        }
+      }
+
+      const identifierRefs = new Set();
+
+      const collectIdentifiers = (node, parent) => {
+        if (!node || typeof node !== 'object') return;
+
+        if (node.type === 'Identifier' && importedLocals.has(node.name)) {
+          const isInImportDecl = importRanges.some(
+            (r) => r.name === node.name && node.start >= r.start && node.end <= r.end
+          );
+
+          if (!isInImportDecl) {
+            if (parent && parent.type === 'Property' && parent.key === node && !parent.computed) {
+            } else {
+              identifierRefs.add(node.name);
+            }
+          }
+        }
+
+        for (const key of Object.keys(node)) {
+          if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+          const child = node[key];
+          if (child && typeof child === 'object') {
+            if (Array.isArray(child)) {
+              for (const item of child) {
+                if (item && typeof item === 'object') {
+                  collectIdentifiers(item, node);
+                }
+              }
+            } else if (child.type) {
+              collectIdentifiers(child, node);
+            }
+          }
+        }
+      };
+
+      for (const node of ast.body) {
+        if (node.type !== 'ImportDeclaration') {
+          collectIdentifiers(node, null);
+        }
+      }
+
+      for (const name of identifierRefs) {
+        usedNames.add(name);
+      }
+    } catch {
+      for (const spec of imp.specifiers) {
+        usedNames.add(spec.local);
+      }
+    }
+
+    return usedNames;
+  }
+
+  _getActuallyUsedDynamicNames(mod, dynImp) {
+    const usedNames = new Set();
+
+    try {
+      const code = mod.code;
+      const ast = acorn.parse(code, {
+        sourceType: 'module',
+        ecmaVersion: 'latest',
+        locations: true,
+      });
+
+      const importVarNames = new Set();
+
+      walk.simple(ast, {
+        VariableDeclarator(node) {
+          if (node.init && node.init.type === 'AwaitExpression' && node.init.argument) {
+            const arg = node.init.argument;
+            if (arg.type === 'ImportExpression' && arg.source && arg.source.type === 'Literal' && arg.source.value === dynImp.source) {
+              if (node.id && node.id.type === 'Identifier') {
+                importVarNames.add(node.id.name);
+              }
+            }
+          }
+        },
+      });
+
+      if (importVarNames.size === 0) {
+        usedNames.add('default');
+        usedNames.add('init');
+        return usedNames;
+      }
+
+      walk.simple(ast, {
+        MemberExpression(node) {
+          if (node.object && node.object.type === 'Identifier' && importVarNames.has(node.object.name)) {
+            if (node.property && node.property.type === 'Identifier' && !node.computed) {
+              usedNames.add(node.property.name);
+            }
+          }
+        },
+      });
+    } catch {
+      usedNames.add('default');
+      usedNames.add('init');
+    }
+
+    if (usedNames.size === 0) {
+      usedNames.add('default');
+    }
+
+    return usedNames;
   }
 
   _markDeadExports() {
@@ -119,7 +267,8 @@ class Optimizer {
       if (!mod) continue;
 
       if (!mod.sideEffects && !mod.isEntry && !mod.isDynamicEntry) {
-        const hasAnyUsed = (this.usedExports.get(filePath) || new Set()).size > 0;
+        const used = this.usedExports.get(filePath) || new Set();
+        const hasAnyUsed = used.size > 0;
         if (!hasAnyUsed) {
           this.removedCount++;
           continue;
